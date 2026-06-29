@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -74,10 +75,28 @@ def select_accelerator(preferred: str) -> dict[str, str]:
     }
 
 
+def format_progress(step: int, total_steps: int, started_at: float, now: float | None = None) -> str:
+    now = time.monotonic() if now is None else now
+    elapsed = max(0.0, now - started_at)
+    percent = (step / total_steps * 100.0) if total_steps else 100.0
+    steps_per_second = (step / elapsed) if elapsed > 0 and step else 0.0
+    remaining_steps = max(0, total_steps - step)
+    eta_seconds = (remaining_steps / steps_per_second) if steps_per_second else 0.0
+    return (
+        f"progress step={step}/{total_steps} ({percent:.1f}%) "
+        f"elapsed={elapsed:.1f}s eta={eta_seconds:.1f}s rate={steps_per_second:.2f} steps/s"
+    )
+
+
 def run_simulation(args: argparse.Namespace) -> Simulation:
     sim = build_default_simulation(args.seed, args.agents, args.world_width, args.world_height)
-    for _ in range(args.steps):
+    started_at = time.monotonic()
+    progress_interval = max(0, int(args.progress_interval))
+    for step in range(1, args.steps + 1):
         sim.step()
+        should_report = progress_interval and (step == 1 or step == args.steps or step % progress_interval == 0)
+        if should_report:
+            print(format_progress(step, args.steps, started_at), flush=True)
     return sim
 
 
@@ -117,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7, help="Random seed for reproducible runs.")
     parser.add_argument("--output-dir", type=Path, default=Path("runs/latest"), help="Directory where run outputs are saved.")
     parser.add_argument("--accelerator", choices=["auto", "cpu", "none", "cuda", "a100", "tpu"], default="auto", help="Preferred hardware target to detect/report.")
+    parser.add_argument("--progress-interval", type=int, default=10, help="Print rough progress and ETA every N steps; set to 0 to disable.")
     return parser
 
 

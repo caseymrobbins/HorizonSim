@@ -57,3 +57,19 @@ def test_configurable_run_writes_metrics_events_and_agents(tmp_path):
     assert (tmp_path / "metrics.csv").exists()
     assert (tmp_path / "events.jsonl").exists()
     assert (tmp_path / "agents" / "agent_0.json").exists()
+
+
+def test_progress_output_reports_step_counts(capsys):
+    from horizon_sim.main import build_parser, run_simulation
+
+    args = build_parser().parse_args(["--agents", "2", "--world-size", "8", "--steps", "3", "--progress-interval", "2"])
+    if args.world_size is not None:
+        args.world_width = args.world_size
+        args.world_height = args.world_size
+    run_simulation(args)
+
+    output = capsys.readouterr().out
+    assert "progress step=1/3" in output
+    assert "progress step=2/3" in output
+    assert "progress step=3/3" in output
+    assert "eta=" in output

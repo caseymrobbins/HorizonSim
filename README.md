@@ -16,10 +16,11 @@ python -m horizon_sim.main \
   --world-size 200 \
   --steps 1000 \
   --output-dir runs/experiment-001 \
-  --accelerator auto
+  --accelerator auto \
+  --progress-interval 50
 ```
 
-You can also set rectangular worlds with `--world-width` and `--world-height`. The `--accelerator` flag accepts `auto`, `cpu`, `cuda`, `a100`, and `tpu`. HorizonSim currently runs as a CPU-bound discrete-event simulation, but the command records whether CUDA/A100 or TPU runtimes are visible so accelerator-backed implementations can be selected consistently later.
+The runner prints rough progress with elapsed time, ETA, and steps-per-second at startup, at completion, and every `--progress-interval` steps; use `--progress-interval 0` to disable it. You can also set rectangular worlds with `--world-width` and `--world-height`. The `--accelerator` flag accepts `auto`, `cpu`, `cuda`, `a100`, and `tpu`. HorizonSim currently runs as a CPU-bound discrete-event simulation, but the command records whether CUDA/A100 or TPU runtimes are visible so accelerator-backed implementations can be selected consistently later.
 
 ## Outputs
 
