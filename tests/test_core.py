@@ -39,3 +39,37 @@ def test_simulation_steps_and_harvests_or_moves():
     assert sim.turn == 1
     assert set(sim.world.agent_positions) == {0, 1}
     assert all(agent.spatial_map is not None for agent in sim.agents)
+
+
+def test_configurable_run_writes_metrics_events_and_agents(tmp_path):
+    from horizon_sim.main import build_parser, run_simulation, save_outputs, select_accelerator
+
+    args = build_parser().parse_args(["--agents", "3", "--world-size", "12", "--steps", "2", "--output-dir", str(tmp_path)])
+    if args.world_size is not None:
+        args.world_width = args.world_size
+        args.world_height = args.world_size
+    sim = run_simulation(args)
+    save_outputs(sim, tmp_path, select_accelerator("cpu"))
+
+    assert sim.turn == 2
+    assert len(sim.agents) == 3
+    assert sim.world.width == 12
+    assert (tmp_path / "metrics.csv").exists()
+    assert (tmp_path / "events.jsonl").exists()
+    assert (tmp_path / "agents" / "agent_0.json").exists()
+
+
+def test_progress_output_reports_step_counts(capsys):
+    from horizon_sim.main import build_parser, run_simulation
+
+    args = build_parser().parse_args(["--agents", "2", "--world-size", "8", "--steps", "3", "--progress-interval", "2"])
+    if args.world_size is not None:
+        args.world_width = args.world_size
+        args.world_height = args.world_size
+    run_simulation(args)
+
+    output = capsys.readouterr().out
+    assert "progress step=1/3" in output
+    assert "progress step=2/3" in output
+    assert "progress step=3/3" in output
+    assert "eta=" in output
