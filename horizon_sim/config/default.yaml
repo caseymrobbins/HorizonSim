@@ -1,0 +1,23 @@
+world:
+  width: 50
+  height: 50
+  terrain_distribution:
+    plains: 0.5
+    forest: 0.3
+    mountain: 0.15
+    water: 0.05
+  resource_regrowth:
+    food:
+      forest: {chance: 0.1, max: 5}
+      plains: {chance: 0.05, max: 2}
+    wood:
+      forest: {chance: 0.15, max: 4}
+agents:
+  - id: 0
+    preferences: {food: 0.9, wealth: 0.4, knowledge: 0.3}
+    start_pos: [5, 5]
+    policy: utility_max
+  - id: 1
+    preferences: {food: 0.3, wealth: 0.8, knowledge: 0.6}
+    start_pos: [40, 40]
+    policy: utility_max
