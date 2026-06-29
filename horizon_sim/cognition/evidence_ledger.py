@@ -8,6 +8,7 @@ class Evidence:
     id: int
     source: int
     type: str
+    proposition_id: str
     claim: str
     confidence: float
     status: str
