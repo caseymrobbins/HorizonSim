@@ -1,6 +1,6 @@
 # HorizonSim v1
 
-HorizonSim is a minimal, emergence-first social simulation in Python. It models a 2D world, independently optimizing agents, evidence-based belief updates, computed trust, and simple communication primitives.
+HorizonSim is a minimal, emergence-first social simulation in Python. It models a 2D world, independently optimizing agents, evidence-based belief updates, proposition-dependent epistemic credibility, and simple communication primitives.
 
 ## Run
 
