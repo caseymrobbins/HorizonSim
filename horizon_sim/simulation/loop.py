@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -16,9 +17,10 @@ class OwnershipConfig:
     fine_mult: int = 10       # Fine = max(fine_flat, fine_mult * stolen_value)
     rent_default: int = 2     # Per-unit lease price posted by owners (v1: uniform)
     claim_enabled: bool = True
-    detection: str = "present"  # "present" = owner must be co-located; only mode in v1
+    detection: str = "present"  # "present" = owner within detection_radius (Euclidean)
     fine_payee: str = "owner"   # "owner" | "void"
     unpaid_fine: str = "debt"   # "debt" | "seize_inventory"
+    detection_radius: int = 2   # Euclidean tiles; owner within this distance detects theft
 
 
 @dataclass(frozen=True)
@@ -55,9 +57,14 @@ class Simulation:
     total_theft_detected: int = 0
     total_fines_levied: int = 0
     total_debt_created: int = 0
+    # Cumulative deception totals (Phase 3)
+    total_lies_emitted: int = 0
+    total_lies_detected: int = 0
 
     def __post_init__(self) -> None:
         self._agent_by_id: dict[int, Agent] = {a.id: a for a in self.agents}
+        # (receiver_id, sender_id, claim_text) awaiting contradiction verification
+        self._pending_lie_checks: set[tuple[int, int, str]] = set()
         for agent in self.agents:
             self.world.agent_positions[agent.id] = agent.position
             agent.attach_map(self.world.width, self.world.height)
@@ -92,9 +99,25 @@ class Simulation:
         comm_inbox: dict[int, list[Message]] = defaultdict(list)
         turn_messages = 0
         turn_introductions = 0
+        turn_lies = 0
         for agent in order:
             message = agent.policy.generate_communication(agent, self.world, self.turn)
             if message is not None:
+                # Intercept lie markers before delivery: log ground-truth LIE event,
+                # queue for detection check, then strip the marker so receivers see
+                # only a normal TELL (trust graph must catch it, not the wire format).
+                if "_lie_believed" in message.content:
+                    believed_strength = message.content["_lie_believed"]
+                    claim_text = message.content["claim"]
+                    message.content.pop("_lie_believed")
+                    self.event_ledger.append(SimulationEvent(
+                        self.turn, agent.id, "LIE",
+                        {"receiver": message.receiver, "claimed": claim_text,
+                         "believed": believed_strength},
+                    ))
+                    self._pending_lie_checks.add((message.receiver, agent.id, claim_text))
+                    turn_lies += 1
+                    self.total_lies_emitted += 1
                 comm_inbox[message.receiver].append(message)
                 turn_messages += 1
                 if message.msg_type == "INTRODUCE":
@@ -110,6 +133,11 @@ class Simulation:
         # Phase 7: Resolve Verified / Contradicted Evidence
         for agent in order:
             agent.resolve_evidence_against_observations(observations[agent.id])
+
+        # Phase 7.5: Check whether any pending lies have been caught.
+        # A lie is detected when the receiver has contradicted the claimed proposition
+        # and the sender's credibility for it has dropped below 0.5.
+        turn_lies_detected = self._check_lie_detections()
 
         # Phase 8: Update Epistemic Model
         for agent in order:
@@ -155,6 +183,7 @@ class Simulation:
         self.total_theft_detected += turn_detected
         self.total_fines_levied += turn_fines
         self.total_debt_created += turn_debt
+        self.total_lies_detected += turn_lies_detected
 
         self.metrics_history.append(self.snapshot_metrics(
             turn_messages=turn_messages,
@@ -170,6 +199,8 @@ class Simulation:
             turn_detected=turn_detected,
             turn_fines=turn_fines,
             turn_debt=turn_debt,
+            turn_lies=turn_lies,
+            turn_lies_detected=turn_lies_detected,
         ))
         self.turn += 1
 
@@ -257,7 +288,12 @@ class Simulation:
             amount = ev["amount"]
             rent_due = self.ownership.rent_default * amount
 
-            if harvester.inventory.get("wealth", 0) >= rent_due:
+            # Debt-holders cannot take the rent path; debt is repaid first (Phase 2).
+            # This gives fines teeth: insolvent thieves accrue debt that blocks future rent.
+            debtor = harvester.debt > 0
+            can_pay_rent = not debtor and harvester.inventory.get("wealth", 0) >= rent_due
+
+            if can_pay_rent:
                 # ── RENT PATH ──────────────────────────────────────────────
                 harvester.inventory["wealth"] -= rent_due
                 if self.ownership.fine_payee == "owner":
@@ -269,10 +305,22 @@ class Simulation:
                      "rent": rent_due, "owner": owner.id},
                 ))
             else:
-                # ── THEFT PATH ─────────────────────────────────────────────
+                # ── THEFT PATH (includes debt-blocked harvesters) ──────────
+                if debtor:
+                    # Repay outstanding debt from available wealth before the fine
+                    repaid = min(harvester.inventory.get("wealth", 0), harvester.debt)
+                    if repaid > 0:
+                        harvester.inventory["wealth"] = harvester.inventory.get("wealth", 0) - repaid
+                        harvester.debt -= repaid
                 theft_attempts += 1
                 owner_pos = self.world.agent_positions.get(owner.id)
-                detected = (owner_pos == position)
+                # Detection: owner within detection_radius (Euclidean) of the stolen tile
+                if owner_pos is None:
+                    detected = False
+                else:
+                    _dx = owner_pos[0] - position[0]
+                    _dy = owner_pos[1] - position[1]
+                    detected = math.sqrt(_dx * _dx + _dy * _dy) <= self.ownership.detection_radius
 
                 self.event_ledger.append(SimulationEvent(
                     self.turn, harvester.id, "THEFT",
@@ -391,6 +439,56 @@ class Simulation:
             return None
         return max(resources, key=lambda item: item[1])[0]
 
+    def _check_lie_detections(self) -> int:
+        """Check pending lies for detection: credibility < 0.5 means the receiver
+        has seen contradicting evidence and no longer trusts the sender's claim."""
+        newly_detected = 0
+        done: set[tuple[int, int, str]] = set()
+        for (receiver_id, sender_id, claim) in self._pending_lie_checks:
+            receiver = self._agent_by_id.get(receiver_id)
+            if receiver is None:
+                done.add((receiver_id, sender_id, claim))
+                continue
+            prop_id = receiver._claim_to_proposition_id.get(claim)
+            if prop_id is None:
+                continue  # Evidence not yet ingested; check again next turn
+            cred = receiver.get_credibility(sender_id, prop_id)
+            if cred < 0.5:
+                newly_detected += 1
+                done.add((receiver_id, sender_id, claim))
+        self._pending_lie_checks -= done
+        return newly_detected
+
+    def _compute_concentration_metrics(self) -> dict:
+        result: dict = {}
+        # Ownership HHI per resource: fraction of nodes controlled by each agent, squared and summed.
+        # Unowned nodes each count as their own unique "owner" (dispersed baseline = 1/n).
+        # Monopoly by one agent → 1.0; fully dispersed (no claims) → 1/n_nodes.
+        if self.world.node_positions:
+            for resource, positions in self.world.node_positions.items():
+                if not positions:
+                    continue
+                owner_counts: dict = defaultdict(int)
+                for i, (x, y) in enumerate(positions):
+                    oid = self.world.grid[x][y].owner_id
+                    key = oid if oid is not None else f"_unc_{i}"
+                    owner_counts[key] += 1
+                n = len(positions)
+                result[f"ownership_hhi_{resource}"] = round(
+                    sum((cnt / n) ** 2 for cnt in owner_counts.values()), 4
+                )
+        # Wealth Gini coefficient (0=perfect equality, 1=one agent holds all)
+        n = len(self.agents)
+        gini = 0.0
+        if n > 1:
+            wealth = sorted(a.inventory.get("wealth", 0) for a in self.agents)
+            S = sum(wealth)
+            if S > 0:
+                cumulative = sum((i + 1) * w for i, w in enumerate(wealth))
+                gini = round((2 * cumulative) / (n * S) - (n + 1) / n, 4)
+        result["wealth_gini"] = gini
+        return result
+
     def _compute_network_metrics(self) -> dict:
         n = len(self.agents)
         if n < 2:
@@ -443,6 +541,7 @@ class Simulation:
                     resource_totals[resource] += amount
 
         network = self._compute_network_metrics()
+        concentration = self._compute_concentration_metrics()
 
         return {
             "turn": self.turn,
@@ -488,6 +587,13 @@ class Simulation:
             "total_theft_detected": self.total_theft_detected,
             "total_fines_levied": self.total_fines_levied,
             "total_debt_created": self.total_debt_created,
+            # Deception layer (Phase 3) — per-turn and cumulative
+            "lies_emitted": kw.get("turn_lies", 0),
+            "lies_detected": kw.get("turn_lies_detected", 0),
+            "total_lies_emitted": self.total_lies_emitted,
+            "total_lies_detected": self.total_lies_detected,
+            # Concentration / inequality (Phase 1)
+            **concentration,
         }
 
 

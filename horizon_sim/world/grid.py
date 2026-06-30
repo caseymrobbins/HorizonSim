@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from horizon_sim.world.tile import Tile
 
@@ -17,6 +17,11 @@ class World:
     agent_positions: dict[int, Position] = field(default_factory=dict)
     resource_regrowth: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     rng: random.Random = field(default_factory=random.Random)
+    # Node-based scarcity model — populated by World.random when n_nodes_per_resource > 0.
+    # Distinct geographic clusters per resource force agents to travel and trade
+    # rather than self-supplying from diffuse per-tile yields.
+    node_positions: dict[str, list[Position]] = field(default_factory=dict)
+    node_yield: int = 0  # capacity cap per node; 0 = diffuse (legacy) mode
 
     @classmethod
     def random(
@@ -26,6 +31,8 @@ class World:
         terrain_distribution: dict[str, float],
         resource_regrowth: dict[str, dict[str, dict[str, float]]] | None = None,
         seed: int | None = None,
+        n_nodes_per_resource: int = 3,
+        node_yield: int = 7,
     ) -> "World":
         rng = random.Random(seed)
         terrains = list(terrain_distribution)
@@ -35,16 +42,26 @@ class World:
             col = []
             for _y in range(height):
                 terrain = rng.choices(terrains, weights=weights, k=1)[0]
-                resources = {}
-                if terrain == "forest":
-                    resources = {"food": rng.randint(0, 3), "wood": rng.randint(1, 3)}
-                elif terrain == "plains":
-                    resources = {"food": rng.randint(0, 2)}
-                elif terrain == "mountain":
-                    resources = {"stone": rng.randint(0, 2)}
-                col.append(Tile(terrain=terrain, resources=resources))
+                # Start every tile resource-free; nodes are placed below.
+                col.append(Tile(terrain=terrain, resources={}))
             grid.append(col)
-        return cls(width, height, grid, resource_regrowth=resource_regrowth or {}, rng=rng)
+
+        world = cls(
+            width, height, grid,
+            resource_regrowth=resource_regrowth or {},
+            rng=rng,
+            node_yield=node_yield,
+        )
+
+        if n_nodes_per_resource > 0 and node_yield > 0:
+            world.node_positions = _place_resource_nodes(
+                rng, grid, width, height,
+                resource_types=["food", "wood", "stone"],
+                n_nodes=n_nodes_per_resource,
+                node_yield=node_yield,
+            )
+
+        return world
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height
@@ -68,6 +85,17 @@ class World:
         return observations
 
     def regenerate_resources(self) -> None:
+        if self.node_positions:
+            # Node mode: only regrow at designated node tiles up to node_yield.
+            # Non-node tiles stay empty so scarcity is preserved.
+            for resource, positions in self.node_positions.items():
+                for (x, y) in positions:
+                    tile = self.grid[x][y]
+                    current = tile.resources.get(resource, 0)
+                    if current < self.node_yield and self.rng.random() < 0.15:
+                        tile.resources[resource] = current + 1
+            return
+        # Diffuse mode: terrain-based regrowth (kept for direct World construction in tests)
         for x in range(self.width):
             for y in range(self.height):
                 tile = self.grid[x][y]
@@ -93,3 +121,67 @@ class World:
         taken = min(max(0, amount), available)
         self.grid[x][y].resources[resource] = available - taken
         return taken
+
+
+def _place_resource_nodes(
+    rng: random.Random,
+    grid: list[list[Tile]],
+    width: int,
+    height: int,
+    resource_types: list[str],
+    n_nodes: int,
+    node_yield: int,
+) -> dict[str, list[Position]]:
+    """Place n_nodes clustered nodes per resource type in distinct geographic regions.
+
+    Distinct regions mean agents must travel to different parts of the map for
+    different resource types, creating inter-agent dependence and making nodes
+    worth cornering (both trade-failure and monopoly-failure are addressed).
+    """
+    # Choose well-separated cluster centers (one per resource type)
+    min_sep = max(5, int(min(width, height) * 0.3))
+    centers: list[Position] = []
+    for _ in range(len(resource_types)):
+        chosen: Position | None = None
+        for _attempt in range(500):
+            x = rng.randrange(width)
+            y = rng.randrange(height)
+            if grid[x][y].terrain == "water":
+                continue
+            if all(math.sqrt((x - cx) ** 2 + (y - cy) ** 2) >= min_sep for cx, cy in centers):
+                chosen = (x, y)
+                break
+        if chosen is None:
+            # Fallback: first non-water, non-center tile
+            for x in range(width):
+                for y in range(height):
+                    if grid[x][y].terrain != "water" and (x, y) not in centers:
+                        chosen = (x, y)
+                        break
+                if chosen:
+                    break
+        if chosen:
+            centers.append(chosen)
+
+    cluster_radius = max(2, min(width, height) // 8)
+    node_positions: dict[str, list[Position]] = {}
+
+    for res_type, center in zip(resource_types, centers):
+        nodes: list[Position] = []
+        attempts = 0
+        while len(nodes) < n_nodes and attempts < 400:
+            attempts += 1
+            ox = rng.randint(-cluster_radius, cluster_radius)
+            oy = rng.randint(-cluster_radius, cluster_radius)
+            nx, ny = center[0] + ox, center[1] + oy
+            if (
+                0 <= nx < width
+                and 0 <= ny < height
+                and grid[nx][ny].terrain != "water"
+                and (nx, ny) not in nodes
+            ):
+                nodes.append((nx, ny))
+                grid[nx][ny].resources[res_type] = node_yield
+        node_positions[res_type] = nodes
+
+    return node_positions
