@@ -16,7 +16,9 @@ class Agent:
     preferences: dict[str, float]
     inventory: dict[str, int] = field(default_factory=dict)
     policy: object | None = None
-    known_agents: set[int] = field(default_factory=set)
+    address_book: set[int] = field(default_factory=set)
+    debt: int = 0
+    introducers: dict[int, int] = field(default_factory=dict)  # agent_id → who introduced them
 
     def __post_init__(self) -> None:
         self.spatial_map: SpatialMap | None = None
@@ -40,7 +42,11 @@ class Agent:
         ev_id = len(self.evidence_ledger)
         prop = self._proposition_for_claim(claim)
         self.evidence_ledger.append(Evidence(ev_id, source, evidence_type, prop.id, claim, max(0.0, min(1.0, confidence)), status, turn))
-        prop.supporting_evidence.append(ev_id)
+        # Route to the correct list so prop.contradicting_evidence is populated (Bug #1 fix).
+        if status == "contradicted":
+            prop.contradicting_evidence.append(ev_id)
+        else:
+            prop.supporting_evidence.append(ev_id)
         if status != "pending":
             self.epistemic_state.update_from_evidence(self.evidence_ledger, self.belief_graph)
         return ev_id
@@ -58,12 +64,24 @@ class Agent:
 
     def ingest_messages(self, messages: list[Message], turn: int) -> None:
         for message in messages:
-            self.known_agents.add(message.sender)
             if message.msg_type == "TELL" and "claim" in message.content:
                 claim = message.content["claim"]
                 prop = self._proposition_for_claim(claim)
-                confidence = float(message.content.get("confidence", self.get_credibility(message.sender, prop.id)))
+                confidence = float(message.content.get("confidence", message.confidence))
                 self.add_evidence(message.sender, "communication", claim, confidence, turn)
+            elif message.msg_type == "INTRODUCE" and message.introduced_agent is not None:
+                new_id = message.introduced_agent
+                if new_id != self.id and new_id not in self.address_book:
+                    self.address_book.add(new_id)
+                    if new_id != message.sender:  # Skip self-introductions for blame tracking
+                        self.introducers[new_id] = message.sender
+                self.add_evidence(message.sender, "communication", f"Agent_{new_id} exists", message.confidence, turn)
+                self.add_evidence(message.sender, "communication", f"CanContact(Agent_{new_id})", message.confidence, turn)
+            elif message.msg_type in ("ASK", "OFFER", "ACCEPT", "REJECT"):
+                if "claim" in message.content:
+                    claim = message.content["claim"]
+                    confidence = float(message.content.get("confidence", message.confidence))
+                    self.add_evidence(message.sender, "communication", claim, confidence, turn)
 
     def resolve_evidence_against_observations(self, observations: list[dict]) -> None:
         observable_claims = set()
@@ -79,8 +97,14 @@ class Agent:
                 continue
             if ev.claim in observable_claims:
                 self.evidence_ledger[idx] = replace(ev, status="verified")
+                # Evidence stays in supporting_evidence — already correct
             elif ev.claim in false_resource_claims:
                 self.evidence_ledger[idx] = replace(ev, status="contradicted")
+                # Move from supporting to contradicting (Bug #1 fix)
+                prop = self.belief_graph.get(ev.proposition_id)
+                if prop is not None and ev.id in prop.supporting_evidence:
+                    prop.supporting_evidence.remove(ev.id)
+                    prop.contradicting_evidence.append(ev.id)
         self.epistemic_state.update_from_evidence(self.evidence_ledger, self.belief_graph)
 
     def update_beliefs(self, turn: int = 0) -> None:

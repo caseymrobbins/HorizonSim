@@ -36,6 +36,14 @@ def build_default_simulation(
         position = _random_land_position(world)
         preferences = normalize_preferences(profiles[agent_id % len(profiles)])
         agents.append(Agent(agent_id, position, preferences))
+
+    # Initialize address books as a directed ring: agent i → agent (i+1) % n
+    # This creates a strongly connected graph where every agent has exactly one
+    # outgoing contact and one incoming contact.
+    for i, agent in enumerate(agents):
+        next_agent = agents[(i + 1) % len(agents)]
+        agent.address_book.add(next_agent.id)
+
     return Simulation(world, agents)
 
 
@@ -100,17 +108,40 @@ def run_simulation(args: argparse.Namespace) -> Simulation:
     return sim
 
 
+_INFO_ECONOMY_FIELDS = [
+    "messages_sent", "messages_received", "introductions_sent",
+    "evidence_created", "evidence_verified", "evidence_contradicted",
+    "belief_updates", "credibility_updates",
+    "mean_address_book_size", "average_network_degree",
+    "communication_graph_diameter", "information_diffusion_rate",
+    "total_messages_sent", "total_introductions_sent",
+    "total_evidence_created", "total_evidence_verified",
+    "total_evidence_contradicted", "total_belief_updates",
+]
+
+_OWNERSHIP_FIELDS = [
+    "claims", "rent_paid", "theft_attempts", "theft_detected", "fines_levied", "debt_created",
+    "total_claims", "total_rent_paid", "total_theft_attempts", "total_theft_detected",
+    "total_fines_levied", "total_debt_created",
+]
+
+
 def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "accelerator.json").write_text(json.dumps(accelerator, indent=2, sort_keys=True))
     (output_dir / "events.jsonl").write_text("\n".join(json.dumps(asdict(event), sort_keys=True) for event in sim.event_ledger) + "\n")
     (output_dir / "metrics.json").write_text(json.dumps(sim.metrics_history, indent=2, sort_keys=True))
     with (output_dir / "metrics.csv").open("w", newline="") as f:
-        fieldnames = ["turn", "trade_count", "trade_volume", "total_wealth", "mean_wealth", "production", "resources_held"]
+        base_fields = ["turn", "trade_count", "trade_volume", "total_wealth", "mean_wealth", "production", "resources_held"]
+        fieldnames = base_fields + _INFO_ECONOMY_FIELDS + _OWNERSHIP_FIELDS
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in sim.metrics_history:
-            writer.writerow({**row, "production": json.dumps(row["production"], sort_keys=True), "resources_held": json.dumps(row["resources_held"], sort_keys=True)})
+            writer.writerow({
+                **row,
+                "production": json.dumps(row["production"], sort_keys=True),
+                "resources_held": json.dumps(row["resources_held"], sort_keys=True),
+            })
     agents_dir = output_dir / "agents"
     agents_dir.mkdir(exist_ok=True)
     for agent in sim.agents:
@@ -119,7 +150,9 @@ def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str])
             "position": agent.position,
             "preferences": agent.preferences,
             "inventory": agent.inventory,
-            "known_agents": sorted(agent.known_agents),
+            "address_book": sorted(agent.address_book),
+            "debt": agent.debt,
+            "introducers": {str(k): v for k, v in agent.introducers.items()},
             "belief_graph": {prop_id: asdict(prop) for prop_id, prop in agent.belief_graph.items()},
             "evidence_ledger": [asdict(ev) for ev in agent.evidence_ledger],
         }
@@ -128,7 +161,7 @@ def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str])
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run HorizonSim and export metrics, events, and per-agent graphs.")
-    parser.add_argument("--agents", type=int, default=2, help="Number of agents to simulate.")
+    parser.add_argument("--agents", type=int, default=20, help="Number of agents to simulate.")
     parser.add_argument("--world-width", type=int, default=50, help="World width in cells.")
     parser.add_argument("--world-height", type=int, default=50, help="World height in cells.")
     parser.add_argument("--world-size", type=int, help="Shortcut that sets both world width and height.")
