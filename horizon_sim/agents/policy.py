@@ -25,6 +25,10 @@ class UtilityMaxPolicy:
                 best_resource = resource
                 best_score = score
         if best_resource is not None:
+            # Claim unowned resource tiles with 30% probability instead of harvesting.
+            # This lets ownership emerge without halting production entirely.
+            if tile.owner_id is None and world.rng.random() < 0.3:
+                return Action("CLAIM", {})
             return Action("HARVEST", {"resource": best_resource, "amount": 1})
         return Action("MOVE", {"dx": world.rng.choice([-1, 0, 1]), "dy": world.rng.choice([-1, 0, 1])})
 

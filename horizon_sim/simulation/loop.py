@@ -9,6 +9,18 @@ from horizon_sim.communication.message import Message
 from horizon_sim.world.grid import World
 
 
+@dataclass
+class OwnershipConfig:
+    """Exposed tuning knobs for the ownership / rent / enforcement layer."""
+    fine_flat: int = 20       # Minimum fine regardless of stolen value
+    fine_mult: int = 10       # Fine = max(fine_flat, fine_mult * stolen_value)
+    rent_default: int = 2     # Per-unit lease price posted by owners (v1: uniform)
+    claim_enabled: bool = True
+    detection: str = "present"  # "present" = owner must be co-located; only mode in v1
+    fine_payee: str = "owner"   # "owner" | "void"
+    unpaid_fine: str = "debt"   # "debt" | "seize_inventory"
+
+
 @dataclass(frozen=True)
 class SimulationEvent:
     turn: int
@@ -22,6 +34,7 @@ class Simulation:
     world: World
     agents: list[Agent]
     observation_radius: int = 2
+    ownership: OwnershipConfig = field(default_factory=OwnershipConfig)
     turn: int = 0
     event_ledger: list[SimulationEvent] = field(default_factory=list)
     metrics_history: list[dict] = field(default_factory=list)
@@ -35,8 +48,16 @@ class Simulation:
     total_evidence_verified: int = 0
     total_evidence_contradicted: int = 0
     total_belief_updates: int = 0
+    # Cumulative ownership / enforcement totals
+    total_claims: int = 0
+    total_rent_paid: int = 0
+    total_theft_attempts: int = 0
+    total_theft_detected: int = 0
+    total_fines_levied: int = 0
+    total_debt_created: int = 0
 
     def __post_init__(self) -> None:
+        self._agent_by_id: dict[int, Agent] = {a.id: a for a in self.agents}
         for agent in self.agents:
             self.world.agent_positions[agent.id] = agent.position
             agent.attach_map(self.world.width, self.world.height)
@@ -95,9 +116,15 @@ class Simulation:
             agent.update_beliefs(self.turn)
 
         # Phase 9-10: Plan & Execute One Physical Action
+        ownership_events: list[dict] = []
         for agent in order:
             action = agent.policy.choose_action(agent, self.world)
-            self.execute(agent, action)
+            self.execute(agent, action, ownership_events)
+
+        # Phase 10.5: Resolve ownership consequences (rent / theft / enforcement)
+        turn_claims, turn_rent, turn_theft, turn_detected, turn_fines, turn_debt = (
+            self._resolve_ownership_consequences(ownership_events)
+        )
 
         # Phase 11: Update World
         self.settle_local_trades()
@@ -122,6 +149,12 @@ class Simulation:
         self.total_evidence_verified += turn_ev_verified
         self.total_evidence_contradicted += turn_ev_contradicted
         self.total_belief_updates += turn_belief_updates
+        self.total_claims += turn_claims
+        self.total_rent_paid += turn_rent
+        self.total_theft_attempts += turn_theft
+        self.total_theft_detected += turn_detected
+        self.total_fines_levied += turn_fines
+        self.total_debt_created += turn_debt
 
         self.metrics_history.append(self.snapshot_metrics(
             turn_messages=turn_messages,
@@ -131,6 +164,12 @@ class Simulation:
             turn_ev_contradicted=turn_ev_contradicted,
             turn_belief_updates=turn_belief_updates,
             turn_credibility_updates=turn_credibility_updates,
+            turn_claims=turn_claims,
+            turn_rent=turn_rent,
+            turn_theft=turn_theft,
+            turn_detected=turn_detected,
+            turn_fines=turn_fines,
+            turn_debt=turn_debt,
         ))
         self.turn += 1
 
@@ -146,8 +185,16 @@ class Simulation:
             details["proposition"] = message.content["claim"]
         self.event_ledger.append(SimulationEvent(self.turn, agent_id, "COMMUNICATE", details))
 
-    def execute(self, agent: Agent, action: Action) -> None:
-        if action.kind == "MOVE":
+    def execute(self, agent: Agent, action: Action, ownership_events: list | None = None) -> None:
+        if action.kind == "CLAIM":
+            x, y = self.world.agent_positions[agent.id]
+            tile = self.world.grid[x][y]
+            if tile.owner_id is None and self.ownership.claim_enabled:
+                tile.owner_id = agent.id
+                self.event_ledger.append(
+                    SimulationEvent(self.turn, agent.id, "CLAIM", {"position": (x, y)})
+                )
+        elif action.kind == "MOVE":
             old_position = self.world.agent_positions[agent.id]
             moved = self.world.move_agent(agent.id, int(action.params.get("dx", 0)), int(action.params.get("dy", 0)))
             agent.position = self.world.agent_positions[agent.id]
@@ -158,6 +205,9 @@ class Simulation:
                 )
             )
         elif action.kind == "HARVEST":
+            x, y = self.world.agent_positions[agent.id]
+            tile = self.world.grid[x][y]
+            tile_owner = tile.owner_id
             resource = str(action.params["resource"])
             taken = self.world.harvest(agent.id, resource, int(action.params.get("amount", 1)))
             agent.inventory[resource] = agent.inventory.get(resource, 0) + taken
@@ -165,9 +215,144 @@ class Simulation:
             self.event_ledger.append(
                 SimulationEvent(
                     self.turn, agent.id, "PRODUCTION",
-                    {"resource": resource, "amount": taken, "position": agent.position},
+                    {"resource": resource, "amount": taken, "position": (x, y)},
                 )
             )
+            # Queue for ownership resolution if someone else owns this tile
+            if tile_owner is not None and tile_owner != agent.id and taken > 0 and ownership_events is not None:
+                ownership_events.append({
+                    "harvester_id": agent.id,
+                    "position": (x, y),
+                    "resource": resource,
+                    "amount": taken,
+                    "owner_id": tile_owner,
+                })
+
+    def _resolve_ownership_consequences(self, events: list[dict]) -> tuple[int, int, int, int, int, int]:
+        """Process rent and theft for harvests on owned tiles.
+
+        Returns (claims, rent_paid, theft_attempts, theft_detected, fines, debt).
+        `claims` is always 0 here — CLAIM events are counted in execute().
+        """
+        rent_paid = 0
+        theft_attempts = 0
+        theft_detected = 0
+        fines_levied = 0
+        debt_created = 0
+
+        # Count CLAIM events emitted this turn
+        claims = sum(
+            1 for e in self.event_ledger
+            if e.turn == self.turn and e.event_type == "CLAIM"
+        )
+
+        for ev in events:
+            harvester = self._agent_by_id.get(ev["harvester_id"])
+            owner = self._agent_by_id.get(ev["owner_id"])
+            if harvester is None or owner is None:
+                continue
+
+            position = tuple(ev["position"])
+            resource = ev["resource"]
+            amount = ev["amount"]
+            rent_due = self.ownership.rent_default * amount
+
+            if harvester.inventory.get("wealth", 0) >= rent_due:
+                # ── RENT PATH ──────────────────────────────────────────────
+                harvester.inventory["wealth"] -= rent_due
+                if self.ownership.fine_payee == "owner":
+                    owner.inventory["wealth"] = owner.inventory.get("wealth", 0) + rent_due
+                rent_paid += rent_due
+                self.event_ledger.append(SimulationEvent(
+                    self.turn, harvester.id, "RENT_PAID",
+                    {"position": position, "resource": resource, "amount": amount,
+                     "rent": rent_due, "owner": owner.id},
+                ))
+            else:
+                # ── THEFT PATH ─────────────────────────────────────────────
+                theft_attempts += 1
+                owner_pos = self.world.agent_positions.get(owner.id)
+                detected = (owner_pos == position)
+
+                self.event_ledger.append(SimulationEvent(
+                    self.turn, harvester.id, "THEFT",
+                    {"position": position, "resource": resource, "amount": amount,
+                     "owner": owner.id, "detected": detected},
+                ))
+
+                if not detected:
+                    continue  # Anonymous — log only, owner does not know who
+
+                # ── DETECTED ───────────────────────────────────────────────
+                theft_detected += 1
+
+                # Seize stolen goods back to owner
+                seized = min(harvester.inventory.get(resource, 0), amount)
+                harvester.inventory[resource] = harvester.inventory.get(resource, 0) - seized
+                owner.inventory[resource] = owner.inventory.get(resource, 0) + seized
+
+                # Fine = max(fine_flat, fine_mult × stolen value)
+                stolen_value = amount  # 1 wealth per resource unit
+                fine = max(self.ownership.fine_flat, self.ownership.fine_mult * stolen_value)
+                fines_levied += fine
+
+                available = harvester.inventory.get("wealth", 0)
+                paid = min(available, fine)
+                harvester.inventory["wealth"] = available - paid
+                shortfall = fine - paid
+
+                if self.ownership.fine_payee == "owner":
+                    owner.inventory["wealth"] = owner.inventory.get("wealth", 0) + paid
+
+                if shortfall > 0:
+                    if self.ownership.unpaid_fine == "debt":
+                        harvester.debt += shortfall
+                        debt_created += shortfall
+                    elif self.ownership.unpaid_fine == "seize_inventory":
+                        remaining = shortfall
+                        for r in list(harvester.inventory):
+                            if r == "wealth" or remaining <= 0:
+                                continue
+                            qty = harvester.inventory.get(r, 0)
+                            take = min(qty, remaining)
+                            harvester.inventory[r] -= take
+                            if self.ownership.fine_payee == "owner":
+                                owner.inventory[r] = owner.inventory.get(r, 0) + take
+                            remaining -= take
+
+                # ── TRUST PENALTY (Bug #2 fix: direct + introducer) ───────
+                # Inject a contradicted evidence record attributed to the thief
+                # so the victim's credibility model lowers the thief's trust.
+                owner.add_evidence(
+                    source=harvester.id,
+                    evidence_type="enforcement",
+                    claim=f"Agent_{harvester.id} honest",
+                    confidence=1.0,
+                    turn=self.turn,
+                    status="contradicted",
+                )
+                owner.update_beliefs(self.turn)
+
+                # Introducer blame: lower trust in whoever vouched for the thief
+                introducer_id = owner.introducers.get(harvester.id)
+                if introducer_id is not None:
+                    owner.add_evidence(
+                        source=introducer_id,
+                        evidence_type="enforcement",
+                        claim=f"Agent_{introducer_id} vouches honestly",
+                        confidence=0.9,
+                        turn=self.turn,
+                        status="contradicted",
+                    )
+                    owner.update_beliefs(self.turn)
+
+                self.event_ledger.append(SimulationEvent(
+                    self.turn, harvester.id, "ENFORCEMENT",
+                    {"position": position, "owner": owner.id, "fine": fine,
+                     "fine_paid": paid, "debt": shortfall},
+                ))
+
+        return claims, rent_paid, theft_attempts, theft_detected, fines_levied, debt_created
 
     def settle_local_trades(self) -> None:
         by_position: dict[tuple[int, int], list[Agent]] = defaultdict(list)
@@ -289,6 +474,20 @@ class Simulation:
             "total_evidence_verified": self.total_evidence_verified,
             "total_evidence_contradicted": self.total_evidence_contradicted,
             "total_belief_updates": self.total_belief_updates,
+            # Ownership economy — per-turn
+            "claims": kw.get("turn_claims", 0),
+            "rent_paid": kw.get("turn_rent", 0),
+            "theft_attempts": kw.get("turn_theft", 0),
+            "theft_detected": kw.get("turn_detected", 0),
+            "fines_levied": kw.get("turn_fines", 0),
+            "debt_created": kw.get("turn_debt", 0),
+            # Ownership economy — cumulative
+            "total_claims": self.total_claims,
+            "total_rent_paid": self.total_rent_paid,
+            "total_theft_attempts": self.total_theft_attempts,
+            "total_theft_detected": self.total_theft_detected,
+            "total_fines_levied": self.total_fines_levied,
+            "total_debt_created": self.total_debt_created,
         }
 
 

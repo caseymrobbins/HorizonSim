@@ -119,6 +119,12 @@ _INFO_ECONOMY_FIELDS = [
     "total_evidence_contradicted", "total_belief_updates",
 ]
 
+_OWNERSHIP_FIELDS = [
+    "claims", "rent_paid", "theft_attempts", "theft_detected", "fines_levied", "debt_created",
+    "total_claims", "total_rent_paid", "total_theft_attempts", "total_theft_detected",
+    "total_fines_levied", "total_debt_created",
+]
+
 
 def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -127,7 +133,7 @@ def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str])
     (output_dir / "metrics.json").write_text(json.dumps(sim.metrics_history, indent=2, sort_keys=True))
     with (output_dir / "metrics.csv").open("w", newline="") as f:
         base_fields = ["turn", "trade_count", "trade_volume", "total_wealth", "mean_wealth", "production", "resources_held"]
-        fieldnames = base_fields + _INFO_ECONOMY_FIELDS
+        fieldnames = base_fields + _INFO_ECONOMY_FIELDS + _OWNERSHIP_FIELDS
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in sim.metrics_history:
@@ -145,6 +151,8 @@ def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str])
             "preferences": agent.preferences,
             "inventory": agent.inventory,
             "address_book": sorted(agent.address_book),
+            "debt": agent.debt,
+            "introducers": {str(k): v for k, v in agent.introducers.items()},
             "belief_graph": {prop_id: asdict(prop) for prop_id, prop in agent.belief_graph.items()},
             "evidence_ledger": [asdict(ev) for ev in agent.evidence_ledger],
         }
