@@ -16,7 +16,7 @@ class Agent:
     preferences: dict[str, float]
     inventory: dict[str, int] = field(default_factory=dict)
     policy: object | None = None
-    known_agents: set[int] = field(default_factory=set)
+    address_book: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.spatial_map: SpatialMap | None = None
@@ -58,12 +58,22 @@ class Agent:
 
     def ingest_messages(self, messages: list[Message], turn: int) -> None:
         for message in messages:
-            self.known_agents.add(message.sender)
             if message.msg_type == "TELL" and "claim" in message.content:
                 claim = message.content["claim"]
                 prop = self._proposition_for_claim(claim)
-                confidence = float(message.content.get("confidence", self.get_credibility(message.sender, prop.id)))
+                confidence = float(message.content.get("confidence", message.confidence))
                 self.add_evidence(message.sender, "communication", claim, confidence, turn)
+            elif message.msg_type == "INTRODUCE" and message.introduced_agent is not None:
+                new_id = message.introduced_agent
+                if new_id != self.id and new_id not in self.address_book:
+                    self.address_book.add(new_id)
+                self.add_evidence(message.sender, "communication", f"Agent_{new_id} exists", message.confidence, turn)
+                self.add_evidence(message.sender, "communication", f"CanContact(Agent_{new_id})", message.confidence, turn)
+            elif message.msg_type in ("ASK", "OFFER", "ACCEPT", "REJECT"):
+                if "claim" in message.content:
+                    claim = message.content["claim"]
+                    confidence = float(message.content.get("confidence", message.confidence))
+                    self.add_evidence(message.sender, "communication", claim, confidence, turn)
 
     def resolve_evidence_against_observations(self, observations: list[dict]) -> None:
         observable_claims = set()
