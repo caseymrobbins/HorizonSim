@@ -133,8 +133,13 @@ def save_outputs(sim: Simulation, output_dir: Path, accelerator: dict[str, str])
     (output_dir / "metrics.json").write_text(json.dumps(sim.metrics_history, indent=2, sort_keys=True))
     with (output_dir / "metrics.csv").open("w", newline="") as f:
         base_fields = ["turn", "trade_count", "trade_volume", "total_wealth", "mean_wealth", "production", "resources_held"]
-        fieldnames = base_fields + _INFO_ECONOMY_FIELDS + _OWNERSHIP_FIELDS
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        # Dynamic fields (e.g. ownership_hhi_<resource>, wealth_gini) come from the metrics dict
+        dynamic_fields = sorted(
+            k for k in (sim.metrics_history[0] if sim.metrics_history else {})
+            if k not in set(base_fields + _INFO_ECONOMY_FIELDS + _OWNERSHIP_FIELDS)
+        )
+        fieldnames = base_fields + _INFO_ECONOMY_FIELDS + _OWNERSHIP_FIELDS + dynamic_fields
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in sim.metrics_history:
             writer.writerow({
